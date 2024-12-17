@@ -3,6 +3,17 @@ from telegram import Update, Poll
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import asyncio
 import re
+from flask import Flask
+from threading import Thread
+
+#setup flask server
+def run_flask():
+    app = Flask("")
+    @app.route("/")
+    def home():
+        return "bot is running"
+
+    app.run(host="0.0.0.0",port=8000)
 
 # Load the bot token from Render environment variables
 TOKEN = os.environ["TOKEN"]
@@ -74,4 +85,5 @@ def main():
     application.run_polling()
 
 if __name__ == "__main__":
+    Thread(target=run_flask).start()
     main()

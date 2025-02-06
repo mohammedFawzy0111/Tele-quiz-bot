@@ -1,5 +1,5 @@
 import os
-from PyPDF2 import PdfFileReader
+import pdfplumber
 from docx import Document
 from telegram import Update, Poll
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -37,17 +37,20 @@ def read_text_file(path):
 # read pdf files
 def read_pdf_file(path):
     text = ""
-    with open(path, 'rb') as file:
-        reader = PdfFileReader(file)
-        for page_num in range(reader.numPages):
-            text += reader.getPage(page_num).extract_text()
-            text += "\n\n"
-        return text
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                # Replace unknown characters with a space
+                cleaned_text = page_text.encode("utf-8", "ignore").decode("utf-8")
+                cleaned_text = re.sub(r"[^\x00-\x7F]+", " ", cleaned_text)  # Remove non-ASCII characters
+                text += f"{cleaned_text.strip()}\n"
+    return text
     
 # read word file
 def read_word_file(path):
     doc = Document(path)
-    text = "\n".join([[para.text for para in doc.paragraphs]])
+    text = "\n".join([para.text for para in doc.paragraphs])
     return text
 
 # Parse message into questions and answers
@@ -120,53 +123,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def readFile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
         return
-    await forward(update,context)
+    await forward(update, context)
+
     document = update.message.document
     file_id = document.file_id
     file_name = document.file_name
     file = await context.bot.get_file(file_id)
 
     file_path = f"./{file_name}"
-    await update.message.reply_text("processing file....")
+    await update.message.reply_text("Processing file....")
     await file.download_to_drive(file_path)
 
-    # identify file type
-    if file_name.endswith(".txt"):
-        text = read_text_file(file_path)
-    elif file_name.endswith(".pdf"):
-        text = read_pdf_file(file_path)
-    elif file_name.endswith(".docx") or file_name.endswith(".doc"):
-        text = read_word_file(file_path)
-    else:
-        await error(update,context,"Unsupported file type")
-        await update.message.reply_text("Unsupported file type.\nSupported types : [pdf,doc,docx,txt]")
-        return
-
-    parsed = parse_message(text)
-    questions, failed_questions = parsed
-
-    if not questions:
-        await update.message.reply_text(
-            "I couldn't parse your message. Make sure it's formatted correctly."
-        )
-        return
-
     try:
-        for question, options, correct_index in questions:
-            await update.message.reply_poll(
-                question=question,
-                options=options,
-                type=Poll.QUIZ,
-                correct_option_id=correct_index
+        # Identify file type
+        if file_name.endswith(".txt"):
+            text = read_text_file(file_path)
+        elif file_name.endswith(".pdf"):
+            text = read_pdf_file(file_path)
+        elif file_name.endswith(".docx") or file_name.endswith(".doc"):
+            text = read_word_file(file_path)
+        else:
+            await error(update, context, "Unsupported file type")
+            await update.message.reply_text("Unsupported file type.\nSupported types: [pdf, doc, docx, txt]")
+            return  # Exit function early
+
+        # Parse the message
+        questions, failed_questions = parse_message(text)
+
+        if not questions:
+            await update.message.reply_text(
+                "I couldn't parse your message. Make sure it's formatted correctly."
             )
-    except Exception as e:
-        await error(update,context,f"Unexpected error: {e}")
-        await update.message.reply_text(f"Unexpected error: {e}")
-    
-    if failed_questions > 0:
-        await update.message.reply_text(
-            f"Failed to parse {failed_questions} question(s)."
-        )
+            return
+
+        try:
+            for question, options, correct_index in questions:
+                await update.message.reply_poll(
+                    question=question,
+                    options=options,
+                    type=Poll.QUIZ,
+                    correct_option_id=correct_index
+                )
+        except Exception as e:
+            await error(update, context, f"Unexpected error: {e}")
+            await update.message.reply_text(f"Unexpected error: {e}")
+
+        if failed_questions > 0:
+            await update.message.reply_text(
+                f"Failed to parse {failed_questions} question(s)."
+            )
+    finally:
+        # Ensure file is deleted
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 # Handle incoming messages
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

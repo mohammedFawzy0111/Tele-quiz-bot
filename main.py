@@ -28,26 +28,24 @@ ADMIN_CHAT = os.environ["ADMIN_CHAT"]
 if not TOKEN:
     raise ValueError("No TELEGRAM_BOT_TOKEN environment variable set")
 
-# read txt files
+# Read text files
 def read_text_file(path):
     with open(path, 'r', encoding='utf-8') as file:
         return file.read()
-    
 
-# read pdf files
+# Read PDF files
 def read_pdf_file(path):
     text = ""
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text()
             if page_text:
-                # Replace unknown characters with a space
                 cleaned_text = page_text.encode("utf-8", "ignore").decode("utf-8")
                 cleaned_text = re.sub(r"[^\x00-\x7F]+", " ", cleaned_text)  # Remove non-ASCII characters
                 text += f"{cleaned_text.strip()}\n"
     return text
-    
-# read word file
+
+# Read Word files
 def read_word_file(path):
     doc = Document(path)
     text = "\n".join([para.text for para in doc.paragraphs])
@@ -58,16 +56,16 @@ def parse_message(message):
     questions = []
     failed_questions = 0
 
-    # Split message into question blocks based on Arabic and English numbering
-    blocks = re.split(r"\n(?=(\d+[\.\)\-]|[\u0660-\u0669]+[\.\)\-]))", message)
+    # Improved regex for splitting questions
+    blocks = re.split(r"\n(?=\d+\s*[\.\)\-]\s+|\n[\u0660-\u0669]+\s*[\.\)\-]\s+)", message)
 
     for block in blocks:
         lines = block.strip().split("\n")
         if len(lines) < 2:
             continue
 
-        # Extract question
-        question_match = re.match(r"^(\d+|[\u0660-\u0669]+)[\.\)\-]\s*(.+)",lines[0])
+        # Extract question with improved regex
+        question_match = re.match(r"^\s*(\d+|[\u0660-\u0669]+)\s*[\.\)\-]\s*(.+)", lines[0])
         if not question_match:
             failed_questions += 1
             continue
@@ -77,14 +75,14 @@ def parse_message(message):
         correct_index = None
 
         for line in lines[1:]:
-            # Match options like "a) Option" or "أ) خيار"
-            option_match = re.match(r"^([a-hA-H]|[أ-د])[\.\)\-]\s*(.+)", line)
+            # Improved regex for options
+            option_match = re.match(r"^\s*([a-hA-H]|[أ-د])\s*[\.\)\-]\s*(.+)", line)
             if option_match:
                 options.append(option_match.group(2).strip())
-            # Match answer like "Answer: a" or "الإجابة: أ"
-            elif re.match(r"(?i)(?:answer:|الإجابة:)\s*([a-dA-Dأ-د])", line):
-                answer_match = re.search(
-                    r"(?i)(?:answer:|الإجابة:)\s*([a-dA-Dأ-د])", line)
+
+            # Improved regex for extracting correct answer
+            elif re.search(r"(?i)(?:answer|الإجابة)\s*[:\-]?\s*([a-dA-Dأ-د])", line):
+                answer_match = re.search(r"(?i)(?:answer|الإجابة)\s*[:\-]?\s*([a-dA-Dأ-د])", line)
                 if answer_match:
                     correct_letter = answer_match.group(1).lower()
                     if "أ" <= correct_letter <= "د":  # Arabic letters
@@ -92,34 +90,31 @@ def parse_message(message):
                     else:  # English letters
                         correct_index = ord(correct_letter) - ord("a")
 
-        # Validate and shuffle the options
+        # Validate and shuffle options
         if question and options and correct_index is not None:
             shuffled_options = options[:]
             random.shuffle(shuffled_options)
-            correct_index = shuffled_options.index(
-                options[correct_index])  # Adjust for shuffled options
+            correct_index = shuffled_options.index(options[correct_index])  # Adjust for shuffled options
             questions.append((question, shuffled_options, correct_index))
 
     return (questions, failed_questions)
 
-# forward users messages
-async def forward(update:Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# Forward user messages
+async def forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
-    await context.bot.forward_message(chat_id=ADMIN_CHAT,from_chat_id=message.chat_id,message_id=message.message_id)
+    await context.bot.forward_message(chat_id=ADMIN_CHAT, from_chat_id=message.chat_id, message_id=message.message_id)
 
-async def error(update:Update, context: ContextTypes.DEFAULT_TYPE,err) -> None:
-    await context.bot.send_message(chat_id=ADMIN_CHAT,text=f"ERROR OCCURED:{err}\nmessage: {update.message.text},{update.message.document}\nchat_id: {update.message.chat_id}")
+async def error(update: Update, context: ContextTypes.DEFAULT_TYPE, err) -> None:
+    await context.bot.send_message(chat_id=ADMIN_CHAT, text=f"ERROR OCCURRED: {err}\nMessage: {update.message.text}\nChat ID: {update.message.chat_id}")
 
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # check for private chat
     if update.message.chat.type != "private":
         return
-    await forward(update,context)
-    await update.message.reply_text(
-        "Send me a message with questions and answers to create a quiz!")
+    await forward(update, context)
+    await update.message.reply_text("Send me a message with questions and answers to create a quiz!")
 
-# handle files
+# Handle file uploads
 async def readFile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
         return
@@ -145,15 +140,13 @@ async def readFile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             await error(update, context, "Unsupported file type")
             await update.message.reply_text("Unsupported file type.\nSupported types: [pdf, doc, docx, txt]")
-            return  # Exit function early
+            return  
 
         # Parse the message
         questions, failed_questions = parse_message(text)
 
         if not questions:
-            await update.message.reply_text(
-                "I couldn't parse your message. Make sure it's formatted correctly."
-            )
+            await update.message.reply_text("I couldn't parse your message. Make sure it's formatted correctly.")
             return
 
         try:
@@ -169,11 +162,8 @@ async def readFile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"Unexpected error: {e}")
 
         if failed_questions > 0:
-            await update.message.reply_text(
-                f"Failed to parse {failed_questions} question(s)."
-            )
+            await update.message.reply_text(f"Failed to parse {failed_questions} question(s).")
     finally:
-        # Ensure file is deleted
         if os.path.exists(file_path):
             os.remove(file_path)
 
@@ -181,15 +171,12 @@ async def readFile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
         return
-    await forward(update,context)
+    await forward(update, context)
     message = update.message.text
-    parsed = parse_message(message)
-    questions, failed_questions = parsed
+    questions, failed_questions = parse_message(message)
 
     if not questions:
-        await update.message.reply_text(
-            "I couldn't parse your message. Make sure it's formatted correctly."
-        )
+        await update.message.reply_text("I couldn't parse your message. Make sure it's formatted correctly.")
         return
 
     try:
@@ -201,13 +188,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 correct_option_id=correct_index
             )
     except Exception as e:
-        await error(update,context,f"Unexpected error: {e}")
+        await error(update, context, f"Unexpected error: {e}")
         await update.message.reply_text(f"Unexpected error: {e}")
-    
+
     if failed_questions > 0:
-        await update.message.reply_text(
-            f"Failed to parse {failed_questions} question(s)."
-        )
+        await update.message.reply_text(f"Failed to parse {failed_questions} question(s).")
 
 # Main function
 def main():

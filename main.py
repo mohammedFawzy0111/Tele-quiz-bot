@@ -176,7 +176,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     questions, failed_questions = parse_message(message)
 
     if not questions:
-        await update.message.reply_text("I couldn't parse your message. Make sure it's formatted correctly.")
+        await update.message.reply_text(
+            "I couldn't parse your message. Please make sure it's formatted correctly.\n\n"
+            "**Examples of valid formats:**\n"
+            "1) What is the capital of France?\n"
+            "   a) Berlin\n"
+            "   b) Madrid\n"
+            "   c) Paris\n"
+            "   d) Rome\n"
+            "   Answer: c\n\n"
+            "١) ما هي عاصمة فرنسا؟\n"
+            "   أ) برلين\n"
+            "   ب) مدريد\n"
+            "   ج) باريس\n"
+            "   د) روما\n"
+            "   الإجابة: ج"
+        )
         return
 
     try:
@@ -192,8 +207,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"Unexpected error: {e}")
 
     if failed_questions > 0:
-        await update.message.reply_text(f"Failed to parse {failed_questions} question(s).")
-
+        await update.message.reply_text(
+            f"Failed to parse {failed_questions} question(s). Please check your formatting."
+        )
 # Main function
 def main():
     try:

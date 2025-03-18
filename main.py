@@ -54,7 +54,7 @@ def read_word_file(path):
 # Parse message into questions and answers
 def parse_message(message):
     questions = []
-    failed_questions = 0
+    failed_questions = []
 
     # Improved regex for splitting questions
     blocks = re.split(r"\n(?=\d+\s*[\.\)\-]\s+|\n[\u0660-\u0669]+\s*[\.\)\-]\s+)", message)
@@ -62,12 +62,13 @@ def parse_message(message):
     for block in blocks:
         lines = block.strip().split("\n")
         if len(lines) < 2:
+            failed_questions.append(block.strip())  # Store failed question block
             continue
 
         # Extract question with improved regex
         question_match = re.match(r"^\s*(\d+|[\u0660-\u0669]+)\s*[\.\)\-]\s*(.+)", lines[0])
         if not question_match:
-            failed_questions += 1
+            failed_questions.append(block.strip())  # Store failed question block
             continue
 
         question = question_match.group(2).strip()
@@ -79,7 +80,6 @@ def parse_message(message):
             option_match = re.match(r"^\s*([a-hA-H]|[أ-د])\s*[\.\)\-]\s*(.+)", line)
             if option_match:
                 options.append(option_match.group(2).strip())
-
             # Improved regex for extracting correct answer
             elif re.search(r"(?i)(?:answer|الإجابة)\s*[:\-]?\s*([a-dA-Dأ-د])", line):
                 answer_match = re.search(r"(?i)(?:answer|الإجابة)\s*[:\-]?\s*([a-dA-Dأ-د])", line)
@@ -96,8 +96,10 @@ def parse_message(message):
             random.shuffle(shuffled_options)
             correct_index = shuffled_options.index(options[correct_index])  # Adjust for shuffled options
             questions.append((question, shuffled_options, correct_index))
+        else:
+            failed_questions.append(block.strip())  # Store failed question block
 
-    return (questions, failed_questions)
+    return questions, failed_questions
 
 # Forward user messages
 async def forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -146,8 +148,23 @@ async def readFile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         questions, failed_questions = parse_message(text)
 
         if not questions:
-            await update.message.reply_text("I couldn't parse your message. Make sure it's formatted correctly.")
-            return
+        await update.message.reply_text(
+            "I couldn't parse your message. Please make sure it's formatted correctly.\n\n"
+            "**Examples of valid formats:**\n"
+            "1) What is the capital of France?\n"
+            "   a) Berlin\n"
+            "   b) Madrid\n"
+            "   c) Paris\n"
+            "   d) Rome\n"
+            "   Answer: c\n\n"
+            "١) ما هي عاصمة فرنسا؟\n"
+            "   أ) برلين\n"
+            "   ب) مدريد\n"
+            "   ج) باريس\n"
+            "   د) روما\n"
+            "   الإجابة: ج"
+        )
+        return
 
         try:
             for question, options, correct_index in questions:
@@ -161,8 +178,11 @@ async def readFile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await error(update, context, f"Unexpected error: {e}")
             await update.message.reply_text(f"Unexpected error: {e}")
 
-        if failed_questions > 0:
-            await update.message.reply_text(f"Failed to parse {failed_questions} question(s).")
+        if failed_questions:
+            failed_text = "\n\n".join(f"- {q}" for q in failed_questions)
+            await update.message.reply_text(
+                f"⚠️ Failed to parse the following {len(failed_questions)} question(s):\n\n{failed_text}"
+            )
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -206,10 +226,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await error(update, context, f"Unexpected error: {e}")
         await update.message.reply_text(f"Unexpected error: {e}")
 
-    if failed_questions > 0:
+    if failed_questions:
+        failed_text = "\n\n".join(f"- {q}" for q in failed_questions)
         await update.message.reply_text(
-            f"Failed to parse {failed_questions} question(s). Please check your formatting."
+            f"⚠️ Failed to parse the following {len(failed_questions)} question(s):\n\n{failed_text}"
         )
+
 # Main function
 def main():
     try:

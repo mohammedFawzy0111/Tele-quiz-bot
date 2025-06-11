@@ -103,6 +103,7 @@ def parse_message(message):
 
 # Forward user messages
 async def forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    return
     message = update.message
     await context.bot.forward_message(chat_id=ADMIN_CHAT, from_chat_id=message.chat_id, message_id=message.message_id)
 

@@ -216,6 +216,8 @@ async def startup():
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     tg_app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
+    await tg_app.initialize()
+
     await tg_app.bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
 
 

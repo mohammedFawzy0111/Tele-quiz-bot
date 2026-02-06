@@ -2,12 +2,15 @@ import os
 import re
 import random
 import asyncio
+import tempfile
+from typing import Tuple, List
+
 import pdfplumber
 from docx import Document
-
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from telegram import Update, Poll
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -15,183 +18,165 @@ from telegram.ext import (
     filters,
 )
 
-# =======================
-# Environment variables
-# =======================
-TOKEN = os.environ.get("TOKEN")
-ADMIN_CHAT = os.environ.get("ADMIN_CHAT")
+# ================== ENV ==================
 
-if not TOKEN:
-    raise RuntimeError("TOKEN environment variable not set")
+TOKEN = os.environ["TOKEN"]
+PORT = int(os.environ.get("PORT", 8000))
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://your-app.koyeb.app
+WEBHOOK_PATH = "/webhook"
 
-# =======================
-# Telegram application
-# =======================
-application = ApplicationBuilder().token(TOKEN).build()
+# ================== FASTAPI ==================
 
-# =======================
-# FastAPI app
-# =======================
 app = FastAPI()
+tg_app: Application | None = None
+
 
 @app.get("/")
 async def health():
-    """Health check endpoint (used for pings)"""
     return {"status": "ok"}
 
-WEBHOOK_PATH = "/webhook"
 
 @app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    if request.headers.get("content-type") != "application/json":
-        raise HTTPException(status_code=403)
-
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
+async def telegram_webhook(req: Request):
+    update = Update.de_json(await req.json(), tg_app.bot)
+    await tg_app.process_update(update)
     return {"ok": True}
 
-# =======================
-# File readers
-# =======================
+
+# ================== FILE READERS ==================
+
 def read_text_file(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
 
 def read_pdf_file(path: str) -> str:
     text = ""
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                cleaned = page_text.encode("utf-8", "ignore").decode("utf-8")
-                cleaned = re.sub(r"[^\x00-\x7F]+", " ", cleaned)
-                text += cleaned + "\n"
+            t = page.extract_text()
+            if t:
+                t = re.sub(r"[^\x00-\x7F]+", " ", t)
+                text += t + "\n"
     return text
+
 
 def read_word_file(path: str) -> str:
     doc = Document(path)
     return "\n".join(p.text for p in doc.paragraphs)
 
-# =======================
-# Parsing logic
-# =======================
-def parse_message(message: str):
+
+# ================== PARSER ==================
+
+def parse_message(message: str) -> Tuple[List[tuple], List[str]]:
     questions = []
-    failed_questions = []
+    failed = []
 
     blocks = re.split(
         r"\n(?=\d+\s*[\.\)\-]\s+|\n[\u0660-\u0669]+\s*[\.\)\-]\s+)",
-        message
+        message,
     )
 
     for block in blocks:
-        lines = block.strip().split("\n")
+        lines = block.strip().splitlines()
         if len(lines) < 2:
-            failed_questions.append(block.strip())
+            failed.append(block)
             continue
 
-        q_match = re.match(r"^\s*(\d+|[\u0660-\u0669]+)\s*[\.\)\-]\s*(.+)", lines[0])
+        q_match = re.match(
+            r"^\s*(\d+|[\u0660-\u0669]+)\s*[\.\)\-]\s*(.+)",
+            lines[0],
+        )
         if not q_match:
-            failed_questions.append(block.strip())
+            failed.append(block)
             continue
 
-        question = q_match.group(2).strip()
+        question = q_match.group(2)
         options = []
-        correct_index = None
+        correct = None
 
         for line in lines[1:]:
-            opt_match = re.match(r"^\s*([a-hA-H]|[أ-د])\s*[\.\)\-]\s*(.+)", line)
-            if opt_match:
-                options.append(opt_match.group(2).strip())
-            else:
-                ans_match = re.search(
-                    r"(?i)(?:answer|الإجابة)\s*[:\-]?\s*([a-dA-Dأ-د])",
-                    line
-                )
-                if ans_match:
-                    letter = ans_match.group(1).lower()
-                    if "أ" <= letter <= "د":
-                        correct_index = ord(letter) - ord("أ")
-                    else:
-                        correct_index = ord(letter) - ord("a")
+            opt = re.match(r"^\s*([a-hA-H]|[أ-د])[\.\)\-]\s*(.+)", line)
+            if opt:
+                options.append(opt.group(2))
+                continue
 
-        if question and options and correct_index is not None:
-            shuffled = options[:]
-            random.shuffle(shuffled)
-            correct_index = shuffled.index(options[correct_index])
-            questions.append((question, shuffled, correct_index))
-        else:
-            failed_questions.append(block.strip())
-
-    return questions, failed_questions
-
-# =======================
-# Error handler (safe)
-# =======================
-async def error(update: Update, context: ContextTypes.DEFAULT_TYPE, err: str):
-    if ADMIN_CHAT:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT,
-                text=f"ERROR: {err}"
+            ans = re.search(
+                r"(?i)(answer|الإجابة)\s*[:\-]?\s*([a-dA-Dأ-د])",
+                line,
             )
-        except Exception:
-            pass
+            if ans:
+                c = ans.group(2).lower()
+                correct = (
+                    ord(c) - ord("أ")
+                    if "أ" <= c <= "د"
+                    else ord(c) - ord("a")
+                )
 
-# =======================
-# Bot handlers
-# =======================
+        if correct is None or correct >= len(options):
+            failed.append(block)
+            continue
+
+        shuffled = options[:]
+        random.shuffle(shuffled)
+        correct = shuffled.index(options[correct])
+        questions.append((question, shuffled, correct))
+
+    return questions, failed
+
+
+# ================== HANDLERS ==================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or update.message.chat.type != "private":
+    if not update.message:
         return
     await update.message.reply_text(
-        "Send me questions (text or file) and I’ll turn them into a quiz 🧠"
+        "Send questions or upload a file to generate quiz polls."
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.message.chat.type != "private":
         return
 
     questions, failed = parse_message(update.message.text)
 
     if not questions:
-        await update.message.reply_text("Couldn't parse questions. Check the format.")
+        await update.message.reply_text("Couldn't parse questions.")
         return
 
-    try:
-        for q, opts, correct in questions:
-            await update.message.reply_poll(
-                question=q,
-                options=opts,
-                type=Poll.QUIZ,
-                correct_option_id=correct,
-            )
-            await asyncio.sleep(0.1)  # 100 ms delay
-    except Exception as e:
-        await error(update, context, str(e))
+    for q, opts, correct in questions:
+        await update.message.reply_poll(
+            question=q,
+            options=opts,
+            type=Poll.QUIZ,
+            correct_option_id=correct,
+        )
+        await asyncio.sleep(0.1)
 
     if failed:
         await update.message.reply_text(
             f"⚠️ Failed to parse {len(failed)} question(s)."
         )
 
-async def read_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or update.message.chat.type != "private":
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.document:
         return
 
     doc = update.message.document
     file = await context.bot.get_file(doc.file_id)
 
-    path = f"./{doc.file_name}"
-    await file.download_to_drive(path)
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        path = tmp.name
 
     try:
-        if path.endswith(".txt"):
-            text = read_text_file(path)
-        elif path.endswith(".pdf"):
+        if doc.file_name.endswith(".pdf"):
             text = read_pdf_file(path)
-        elif path.endswith((".doc", ".docx")):
+        elif doc.file_name.endswith(".txt"):
+            text = read_text_file(path)
+        elif doc.file_name.endswith((".doc", ".docx")):
             text = read_word_file(path)
         else:
             await update.message.reply_text("Unsupported file type.")
@@ -212,14 +197,29 @@ async def read_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"⚠️ Failed to parse {len(failed)} question(s)."
             )
-
     finally:
-        if os.path.exists(path):
-            os.remove(path)
+        os.unlink(path)
 
-# =======================
-# Register handlers
-# =======================
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-application.add_handler(MessageHandler(filters.Document.ALL, read_file))
+
+# ================== STARTUP ==================
+
+@app.on_event("startup")
+async def startup():
+    global tg_app
+    tg_app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
+
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    tg_app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
+    await tg_app.bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)

@@ -1,9 +1,7 @@
 import os
 import re
-import random
 import asyncio
 import tempfile
-from typing import Tuple, List
 
 import pdfplumber
 from docx import Document
@@ -17,7 +15,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
+from parser import parse_message
 # ================== ENV ==================
 
 TOKEN = os.environ["TOKEN"]
@@ -65,64 +63,6 @@ def read_word_file(path: str) -> str:
     doc = Document(path)
     return "\n".join(p.text for p in doc.paragraphs)
 
-
-# ================== PARSER ==================
-
-def parse_message(message: str) -> Tuple[List[tuple], List[str]]:
-    questions = []
-    failed = []
-
-    blocks = re.split(
-        r"\n(?=\d+\s*[\.\)\-]\s+|\n[\u0660-\u0669]+\s*[\.\)\-]\s+)",
-        message,
-    )
-
-    for block in blocks:
-        lines = block.strip().splitlines()
-        if len(lines) < 2:
-            failed.append(block)
-            continue
-
-        q_match = re.match(
-            r"^\s*(\d+|[\u0660-\u0669]+)\s*[\.\)\-]\s*(.+)",
-            lines[0],
-        )
-        if not q_match:
-            failed.append(block)
-            continue
-
-        question = q_match.group(2)
-        options = []
-        correct = None
-
-        for line in lines[1:]:
-            opt = re.match(r"^\s*([a-hA-H]|[أ-د])[\.\)\-]\s*(.+)", line)
-            if opt:
-                options.append(opt.group(2))
-                continue
-
-            ans = re.search(
-                r"(?i)(answer|الإجابة)\s*[:\-]?\s*([a-dA-Dأ-د])",
-                line,
-            )
-            if ans:
-                c = ans.group(2).lower()
-                correct = (
-                    ord(c) - ord("أ")
-                    if "أ" <= c <= "د"
-                    else ord(c) - ord("a")
-                )
-
-        if correct is None or correct >= len(options):
-            failed.append(block)
-            continue
-
-        shuffled = options[:]
-        random.shuffle(shuffled)
-        correct = shuffled.index(options[correct])
-        questions.append((question, shuffled, correct))
-
-    return questions, failed
 
 
 # ================== HANDLERS ==================

@@ -8,7 +8,6 @@ import pdfplumber
 from docx import Document
 from fastapi import FastAPI, Request
 from telegram import Update, Poll
-from telegram.error import BadRequest, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -50,9 +49,13 @@ async def health():
 async def telegram_webhook(req: Request):
     try:
         update = Update.de_json(await req.json(), tg_app.bot)
-        await tg_app.process_update(update)
-    except Exception as e:
+
+        # 🔥 Process update in background (non-blocking)
+        asyncio.create_task(tg_app.process_update(update))
+
+    except Exception:
         logger.exception("Webhook processing failed")
+
     return {"ok": True}
 
 
@@ -81,7 +84,10 @@ def read_word_file(path: str) -> str:
 
 # ================== SAFE POLL SENDER ==================
 
-async def send_safe_poll(update: Update, q, opts, correct):
+async def send_poll_safe(update: Update, q, opts, correct):
+    if not update.message:
+        return
+
     try:
         if not (2 <= len(opts) <= 12):
             await update.message.reply_text(
@@ -90,44 +96,30 @@ async def send_safe_poll(update: Update, q, opts, correct):
             return
 
         await update.message.reply_poll(
-            question=q[:300],  # Telegram question limit safety
+            question=q[:300],  # Telegram limit safety
             options=opts[:12],
             type=Poll.QUIZ,
             correct_option_id=correct,
         )
 
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2)  # 👈 adjusted delay
 
-    except BadRequest as e:
-        logger.warning(f"BadRequest while sending poll: {e}")
+    except Exception:
+        logger.exception("Failed to send poll")
         await update.message.reply_text(
-            "⚠️ Failed to send one question (invalid format)."
-        )
-
-    except TimedOut:
-        logger.warning("Telegram API timeout")
-        await update.message.reply_text(
-            "⚠️ Telegram timeout. Please try again."
-        )
-
-    except Exception as e:
-        logger.exception("Unexpected poll error")
-        await update.message.reply_text(
-            "⚠️ Unexpected error while sending a question."
+            "⚠️ Failed to send one question."
         )
 
 
 # ================== HANDLERS ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not update.message:
-            return
-        await update.message.reply_text(
-            "Send questions or upload a file to generate quiz polls."
-        )
-    except Exception:
-        logger.exception("Start handler failed")
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "Send questions or upload a file to generate quiz polls."
+    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,14 +127,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        questions, failed = parse_message(update.message.text)
+        # ⚡ Run parsing in thread
+        questions, failed = await asyncio.to_thread(
+            parse_message, update.message.text
+        )
 
         if not questions:
             await update.message.reply_text("❌ Couldn't parse questions.")
             return
 
         for q, opts, correct in questions:
-            await send_safe_poll(update, q, opts, correct)
+            await send_poll_safe(update, q, opts, correct)
 
         if failed:
             await update.message.reply_text(
@@ -150,9 +145,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     except Exception:
-        logger.exception("Text handler crashed")
+        logger.exception("Text handler failed")
         await update.message.reply_text(
-            "❌ Something went wrong while processing your text."
+            "❌ Error processing your text."
         )
 
 
@@ -160,8 +155,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.document:
         return
 
+    doc = update.message.document
+
     try:
-        doc = update.message.document
         file = await context.bot.get_file(doc.file_id)
 
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
@@ -169,24 +165,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             path = tmp.name
 
         try:
+            # ⚡ Offload heavy file reading
             if doc.file_name.endswith(".pdf"):
-                text = read_pdf_file(path)
+                text = await asyncio.to_thread(read_pdf_file, path)
             elif doc.file_name.endswith(".txt"):
-                text = read_text_file(path)
+                text = await asyncio.to_thread(read_text_file, path)
             elif doc.file_name.endswith((".doc", ".docx")):
-                text = read_word_file(path)
+                text = await asyncio.to_thread(read_word_file, path)
             else:
                 await update.message.reply_text("❌ Unsupported file type.")
                 return
 
-            questions, failed = parse_message(text)
+            # ⚡ Offload parsing
+            questions, failed = await asyncio.to_thread(parse_message, text)
 
             if not questions:
                 await update.message.reply_text("❌ Couldn't parse questions.")
                 return
 
             for q, opts, correct in questions:
-                await send_safe_poll(update, q, opts, correct)
+                await send_poll_safe(update, q, opts, correct)
 
             if failed:
                 await update.message.reply_text(
@@ -197,20 +195,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.unlink(path)
 
     except Exception:
-        logger.exception("File handler crashed")
+        logger.exception("File handler failed")
         await update.message.reply_text(
-            "❌ Error while processing the file."
-        )
-
-
-# ================== GLOBAL ERROR HANDLER ==================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Global error handler caught:", exc_info=context.error)
-
-    if isinstance(update, Update) and update.message:
-        await update.message.reply_text(
-            "⚠️ Unexpected internal error occurred."
+            "❌ Error processing the file."
         )
 
 
@@ -226,12 +213,21 @@ async def startup():
     tg_app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
-    tg_app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-
-    tg_app.add_error_handler(error_handler)
+    tg_app.add_handler(
+        MessageHandler(filters.Document.ALL, handle_file)
+    )
 
     await tg_app.initialize()
-    await tg_app.bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
+
+    # 🔥 Safe webhook setup (prevents flood during deploy)
+    webhook_url = WEBHOOK_URL + WEBHOOK_PATH
+    info = await tg_app.bot.get_webhook_info()
+
+    if info.url != webhook_url:
+        await tg_app.bot.set_webhook(webhook_url)
+        logger.info("Webhook set successfully.")
+    else:
+        logger.info("Webhook already set. Skipping.")
 
 
 if __name__ == "__main__":

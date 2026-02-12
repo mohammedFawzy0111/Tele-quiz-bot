@@ -2,11 +2,13 @@ import os
 import re
 import asyncio
 import tempfile
+import logging
 
 import pdfplumber
 from docx import Document
 from fastapi import FastAPI, Request
 from telegram import Update, Poll
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -15,12 +17,22 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 from parser import parse_message
+
+# ================== LOGGING ==================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
 # ================== ENV ==================
 
 TOKEN = os.environ["TOKEN"]
 PORT = int(os.environ.get("PORT", 8000))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://your-app.koyeb.app
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 WEBHOOK_PATH = "/webhook"
 
 # ================== FASTAPI ==================
@@ -36,8 +48,11 @@ async def health():
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(req: Request):
-    update = Update.de_json(await req.json(), tg_app.bot)
-    await tg_app.process_update(update)
+    try:
+        update = Update.de_json(await req.json(), tg_app.bot)
+        await tg_app.process_update(update)
+    except Exception as e:
+        logger.exception("Webhook processing failed")
     return {"ok": True}
 
 
@@ -64,39 +79,80 @@ def read_word_file(path: str) -> str:
     return "\n".join(p.text for p in doc.paragraphs)
 
 
+# ================== SAFE POLL SENDER ==================
+
+async def send_safe_poll(update: Update, q, opts, correct):
+    try:
+        if not (2 <= len(opts) <= 12):
+            await update.message.reply_text(
+                f"⚠️ Skipped question (invalid options count: {len(opts)})"
+            )
+            return
+
+        await update.message.reply_poll(
+            question=q[:300],  # Telegram question limit safety
+            options=opts[:12],
+            type=Poll.QUIZ,
+            correct_option_id=correct,
+        )
+
+        await asyncio.sleep(0.1)
+
+    except BadRequest as e:
+        logger.warning(f"BadRequest while sending poll: {e}")
+        await update.message.reply_text(
+            "⚠️ Failed to send one question (invalid format)."
+        )
+
+    except TimedOut:
+        logger.warning("Telegram API timeout")
+        await update.message.reply_text(
+            "⚠️ Telegram timeout. Please try again."
+        )
+
+    except Exception as e:
+        logger.exception("Unexpected poll error")
+        await update.message.reply_text(
+            "⚠️ Unexpected error while sending a question."
+        )
+
 
 # ================== HANDLERS ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    await update.message.reply_text(
-        "Send questions or upload a file to generate quiz polls."
-    )
+    try:
+        if not update.message:
+            return
+        await update.message.reply_text(
+            "Send questions or upload a file to generate quiz polls."
+        )
+    except Exception:
+        logger.exception("Start handler failed")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.message.chat.type != "private":
         return
 
-    questions, failed = parse_message(update.message.text)
+    try:
+        questions, failed = parse_message(update.message.text)
 
-    if not questions:
-        await update.message.reply_text("Couldn't parse questions.")
-        return
+        if not questions:
+            await update.message.reply_text("❌ Couldn't parse questions.")
+            return
 
-    for q, opts, correct in questions:
-        await update.message.reply_poll(
-            question=q,
-            options=opts,
-            type=Poll.QUIZ,
-            correct_option_id=correct,
-        )
-        await asyncio.sleep(0.1)
+        for q, opts, correct in questions:
+            await send_safe_poll(update, q, opts, correct)
 
-    if failed:
+        if failed:
+            await update.message.reply_text(
+                f"⚠️ Failed to parse {len(failed)} question(s)."
+            )
+
+    except Exception:
+        logger.exception("Text handler crashed")
         await update.message.reply_text(
-            f"⚠️ Failed to parse {len(failed)} question(s)."
+            "❌ Something went wrong while processing your text."
         )
 
 
@@ -104,41 +160,58 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.document:
         return
 
-    doc = update.message.document
-    file = await context.bot.get_file(doc.file_id)
-
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        await file.download_to_drive(tmp.name)
-        path = tmp.name
-
     try:
-        if doc.file_name.endswith(".pdf"):
-            text = read_pdf_file(path)
-        elif doc.file_name.endswith(".txt"):
-            text = read_text_file(path)
-        elif doc.file_name.endswith((".doc", ".docx")):
-            text = read_word_file(path)
-        else:
-            await update.message.reply_text("Unsupported file type.")
-            return
+        doc = update.message.document
+        file = await context.bot.get_file(doc.file_id)
 
-        questions, failed = parse_message(text)
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            await file.download_to_drive(tmp.name)
+            path = tmp.name
 
-        for q, opts, correct in questions:
-            await update.message.reply_poll(
-                question=q,
-                options=opts,
-                type=Poll.QUIZ,
-                correct_option_id=correct,
-            )
-            await asyncio.sleep(0.1)
+        try:
+            if doc.file_name.endswith(".pdf"):
+                text = read_pdf_file(path)
+            elif doc.file_name.endswith(".txt"):
+                text = read_text_file(path)
+            elif doc.file_name.endswith((".doc", ".docx")):
+                text = read_word_file(path)
+            else:
+                await update.message.reply_text("❌ Unsupported file type.")
+                return
 
-        if failed:
-            await update.message.reply_text(
-                f"⚠️ Failed to parse {len(failed)} question(s)."
-            )
-    finally:
-        os.unlink(path)
+            questions, failed = parse_message(text)
+
+            if not questions:
+                await update.message.reply_text("❌ Couldn't parse questions.")
+                return
+
+            for q, opts, correct in questions:
+                await send_safe_poll(update, q, opts, correct)
+
+            if failed:
+                await update.message.reply_text(
+                    f"⚠️ Failed to parse {len(failed)} question(s)."
+                )
+
+        finally:
+            os.unlink(path)
+
+    except Exception:
+        logger.exception("File handler crashed")
+        await update.message.reply_text(
+            "❌ Error while processing the file."
+        )
+
+
+# ================== GLOBAL ERROR HANDLER ==================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Global error handler caught:", exc_info=context.error)
+
+    if isinstance(update, Update) and update.message:
+        await update.message.reply_text(
+            "⚠️ Unexpected internal error occurred."
+        )
 
 
 # ================== STARTUP ==================
@@ -146,18 +219,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @app.on_event("startup")
 async def startup():
     global tg_app
-    tg_app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .build()
-    )
+
+    tg_app = ApplicationBuilder().token(TOKEN).build()
 
     tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    tg_app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
     tg_app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
-    await tg_app.initialize()
+    tg_app.add_error_handler(error_handler)
 
+    await tg_app.initialize()
     await tg_app.bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
 
 

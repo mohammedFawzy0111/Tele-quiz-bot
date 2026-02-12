@@ -228,9 +228,3 @@ async def startup():
         logger.info("Webhook set successfully.")
     else:
         logger.info("Webhook already set. Skipping.")
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
